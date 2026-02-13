@@ -112,6 +112,29 @@ function resolveGenderValue(value) {
   return value;
 }
 
+function parseRequestedGender(value) {
+  if (value === undefined || value === null) {
+    return { gender: null };
+  }
+
+  const raw = String(value).trim();
+  if (!raw) {
+    return { gender: null };
+  }
+
+  const resolved = resolveGenderValue(raw);
+  const normalized = normalizeForMatch(resolved).toUpperCase();
+
+  if (normalized === "M" || normalized === "F" || normalized === "O") {
+    return { gender: normalized };
+  }
+
+  return {
+    gender: null,
+    error: "El género debe ser masculino/femenino (M/F) u opcionalmente O"
+  };
+}
+
 function preferenceToRadioValue(pref, defaultValue = false) {
   const normalized = normalizeForMatch(pref);
   if (!normalized) {
@@ -424,16 +447,17 @@ async function goToNuevaSolicitud(page) {
   return false;
 }
 
-async function configurarFormularioInicial(page) {
+async function configurarFormularioInicial(page, options = {}) {
   console.log("[Credicuotas] Configurando formulario inicial…");
   try {
     await page.evaluate(() => window.scrollTo({ top: 0, behavior: "instant" })).catch(() => {});
+    const selectedGender = resolveGenderValue(options.gender || FORM_DEFAULTS.gender) || "M";
 
     const selectEntries = [
       { label: "Producto", value: FORM_DEFAULTS.product || "MOTO" },
       { label: "Sub Producto", value: FORM_DEFAULTS.subproduct || "MOTOS" },
       { label: "Plazo de Pago", value: FORM_DEFAULTS.term || "4" },
-      { label: "Género", value: resolveGenderValue(FORM_DEFAULTS.gender) || "M" }
+      { label: "Género", value: selectedGender }
     ];
 
     const results = {};
@@ -489,7 +513,7 @@ function parseMontoToNumber(texto) {
   return Number.isNaN(valor) ? null : valor;
 }
 
-async function consultarDNI(dni, montoSolicitado = null) {
+async function consultarDNI(dni, montoSolicitado = null, options = {}) {
   if (!dni) {
     throw new Error("Debe enviar un DNI");
   }
@@ -536,7 +560,7 @@ async function consultarDNI(dni, montoSolicitado = null) {
       throw new Error("No se encontró la acción 'Nueva solicitud'");
     }
 
-    await configurarFormularioInicial(page);
+    await configurarFormularioInicial(page, { gender: options.gender });
 
     console.log("[Credicuotas] Ingresando DNI…");
     await page.waitForSelector('input[name="customerId"]');
@@ -759,7 +783,8 @@ async function consultarDNI(dni, montoSolicitado = null) {
       persona,
       opciones,
       oferta,
-      simulacion
+      simulacion,
+      generoAplicado: resolveGenderValue(options.gender || FORM_DEFAULTS.gender) || "M"
     };
   } finally {
     await browser.close().catch(() => {});
@@ -778,9 +803,16 @@ async function responderConsulta(res, dni, monto) {
     return res.status(400).json({ error: "Debe enviar un DNI válido" });
   }
 
+  const { gender, error: genderError } = parseRequestedGender(
+    res?.locals?.requestGender
+  );
+  if (genderError) {
+    return res.status(400).json({ error: genderError });
+  }
+
   try {
     const montoSolicitado = sanitizeAmountInput(monto);
-    const resultado = await consultarDNI(dni, montoSolicitado);
+    const resultado = await consultarDNI(dni, montoSolicitado, { gender });
     return res.json(resultado);
   } catch (error) {
     console.error("[Credicuotas] Error consultando DNI:", error);
@@ -789,17 +821,34 @@ async function responderConsulta(res, dni, monto) {
 }
 
 app.post("/api/credicuotas/dni", async (req, res) => {
-  const { dni, monto } = req.body || {};
+  const { dni, monto, genero, gender } = req.body || {};
+  res.locals.requestGender = genero ?? gender ?? null;
   await responderConsulta(res, dni, monto);
 });
 
 app.get("/api/credicuotas/dni/:dni", async (req, res) => {
   const { dni } = req.params;
+  const { genero, gender } = req.query || {};
+  res.locals.requestGender = genero ?? gender ?? null;
   await responderConsulta(res, dni, null);
 });
 
 app.get("/api/credicuotas/dni/:dni/monto/:monto", async (req, res) => {
   const { dni, monto } = req.params;
+  const { genero, gender } = req.query || {};
+  res.locals.requestGender = genero ?? gender ?? null;
+  await responderConsulta(res, dni, monto);
+});
+
+app.get("/api/credicuotas/dni/:dni/genero/:genero", async (req, res) => {
+  const { dni, genero } = req.params;
+  res.locals.requestGender = genero;
+  await responderConsulta(res, dni, null);
+});
+
+app.get("/api/credicuotas/dni/:dni/monto/:monto/genero/:genero", async (req, res) => {
+  const { dni, monto, genero } = req.params;
+  res.locals.requestGender = genero;
   await responderConsulta(res, dni, monto);
 });
 
