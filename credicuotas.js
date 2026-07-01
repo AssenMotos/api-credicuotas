@@ -32,12 +32,21 @@ async function selectMuiByLabel(page, labelText, targetText) {
     return false;
   }
 
-  const point = await page.evaluate(({ labelText }) => {
+  const selectState = await page.evaluate(({ labelText, targetText }) => {
     const normalize = str => (str || "")
       .normalize("NFD")
       .replace(/[\u0300-\u036f]/g, "")
       .toLowerCase()
       .trim();
+    const matchesSelectText = (currentText, expectedText) => {
+      const current = normalize(currentText);
+      const expected = normalize(expectedText);
+      if (!current || !expected) return false;
+      if (expected.length <= 2) {
+        return current === expected || current.startsWith(expected);
+      }
+      return current.includes(expected);
+    };
 
     const label = [...document.querySelectorAll("label")]
       .find(el => normalize(el.textContent).includes(normalize(labelText)));
@@ -49,19 +58,32 @@ async function selectMuiByLabel(page, labelText, targetText) {
     const trigger = root.querySelector(".MuiSelect-select");
     if (!trigger) return null;
 
+    const currentText = (trigger.textContent || "").trim();
+    if (matchesSelectText(currentText, targetText)) {
+      return { selected: true };
+    }
+
     trigger.scrollIntoView({ block: "center", behavior: "instant" });
     const rect = trigger.getBoundingClientRect();
     return {
-      x: rect.x + rect.width / 2,
-      y: rect.y + rect.height / 2
+      selected: false,
+      point: {
+        x: rect.x + rect.width / 2,
+        y: rect.y + rect.height / 2
+      }
     };
-  }, { labelText });
+  }, { labelText, targetText });
 
-  if (!point) {
+  if (!selectState) {
     console.warn(`[Credicuotas] No se encontró el select con label ${labelText}`);
     return false;
   }
 
+  if (selectState.selected) {
+    return true;
+  }
+
+  const point = selectState.point;
   await page.mouse.move(point.x, point.y);
   await page.mouse.click(point.x, point.y, { delay: 50 });
   await pause(200);
@@ -69,8 +91,35 @@ async function selectMuiByLabel(page, labelText, targetText) {
   try {
     await page.waitForSelector('ul[role="listbox"] li', { visible: true, timeout: 5000 });
   } catch (error) {
-    console.warn(`[Credicuotas] No se abrió el menú para ${labelText}`, error);
-    return false;
+    const retried = await page.evaluate(({ labelText }) => {
+      const normalize = str => (str || "")
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .toLowerCase()
+        .trim();
+
+      const label = [...document.querySelectorAll("label")]
+        .find(el => normalize(el.textContent).includes(normalize(labelText)));
+      const root = label ? label.closest(".MuiFormControl-root") : null;
+      const trigger = root ? root.querySelector(".MuiSelect-select") : null;
+      if (!trigger) return false;
+
+      trigger.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window }));
+      trigger.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+      return true;
+    }, { labelText }).catch(() => false);
+
+    if (!retried) {
+      console.warn(`[Credicuotas] No se abrió el menú para ${labelText}`, error);
+      return false;
+    }
+
+    try {
+      await page.waitForSelector('ul[role="listbox"] li', { visible: true, timeout: 5000 });
+    } catch (retryError) {
+      console.warn(`[Credicuotas] No se abrió el menú para ${labelText}`, retryError);
+      return false;
+    }
   }
 
   const clicked = await page.evaluate(({ targetText }) => {
@@ -92,6 +141,38 @@ async function selectMuiByLabel(page, labelText, targetText) {
   await page.keyboard.press("Escape").catch(() => {});
   await pause(150);
   return clicked;
+}
+
+async function waitForMuiSelectValue(page, labelText, targetText, timeout = 8000) {
+  try {
+    await page.waitForFunction(({ labelText, targetText }) => {
+      const normalize = str => (str || "")
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .toLowerCase()
+        .trim();
+      const matchesSelectText = (currentText, expectedText) => {
+        const current = normalize(currentText);
+        const expected = normalize(expectedText);
+        if (!current || !expected) return false;
+        if (expected.length <= 2) {
+          return current === expected || current.startsWith(expected);
+        }
+        return current.includes(expected);
+      };
+
+      const label = [...document.querySelectorAll("label")]
+        .find(el => normalize(el.textContent).includes(normalize(labelText)));
+      const root = label ? label.closest(".MuiFormControl-root") : null;
+      const trigger = root ? root.querySelector(".MuiSelect-select") : null;
+      const text = trigger ? (trigger.textContent || "").trim() : "";
+
+      return matchesSelectText(text, targetText);
+    }, { timeout }, { labelText, targetText });
+    return true;
+  } catch (_error) {
+    return false;
+  }
 }
 
 function normalizeForMatch(text) {
@@ -231,8 +312,12 @@ async function calcularPlanCuotas(page, amountValue) {
       };
     });
 
+    const tieneResultado = (Array.isArray(simulacion.planes) && simulacion.planes.length > 0)
+      || Boolean(simulacion.resumen)
+      || Boolean(simulacion.primeraCuota);
+
     return {
-      exito: Array.isArray(simulacion.planes) && simulacion.planes.length > 0,
+      exito: tieneResultado,
       montoSolicitado: amountValue,
       planes: simulacion.planes || [],
       resumen: simulacion.resumen || null,
@@ -465,6 +550,9 @@ async function configurarFormularioInicial(page, options = {}) {
       if (entry.label === "Sub Producto") {
         await pause(2000);
       }
+      if (entry.label === "Plazo de Pago") {
+        await waitForMuiSelectValue(page, entry.label, entry.value, 10000);
+      }
       const ok = await selectMuiByLabel(page, entry.label, entry.value);
       results[entry.label] = ok;
       console.log(`[Credicuotas] ${entry.label} configurado: ${ok}`);
@@ -635,6 +723,10 @@ async function consultarDNI(dni, montoSolicitado = null, options = {}) {
       const lista = document.querySelectorAll('ul[role="listbox"] li');
       return Array.from(lista).map(li => li.innerText.trim());
     });
+
+    const selectedGender = resolveGenderValue(options.gender || FORM_DEFAULTS.gender) || "M";
+    const genderAfterDni = await selectMuiByLabel(page, "Género", selectedGender);
+    console.log(`[Credicuotas] Género tras DNI configurado: ${genderAfterDni}`);
 
     console.log("[Credicuotas] Enviando formulario para obtener oferta…");
     const formularioEnviado = await page.evaluate(() => {
